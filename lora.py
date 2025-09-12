@@ -33,10 +33,10 @@ logger = logging.getLogger(__name__)
 
 AUDIO_DIR = "audio_data"
 OUTPUT_DIR = "finetuned_model"
-NUM_EPOCHS = 10
+NUM_EPOCHS = 5
 BATCH_SIZE = 1
-GRADIENT_ACCUMULATION_STEPS = 4
-LEARNING_RATE = 2e-4
+GRADIENT_ACCUMULATION_STEPS = 8
+LEARNING_RATE = 1e-6
 MAX_GRAD_NORM = 0.1
 NUM_CYCLES = 1.0
 USE_WANDB = False
@@ -320,53 +320,46 @@ class LoRALinear(nn.Module):
         lora_out = F.linear(lora_out, self.lora_B)         # [*, out_features]
         return result + self.scaling * lora_out
 
-def replace_linear_with_lora(module: nn.Module,
-                             r=R,
-                             alpha=APLHA,
-                             dropout=0.0,
-                             target_linear_names=None):
+def replace_linear_with_lora(model: nn.Module, r=R, alpha=APLHA, dropout=0.0, target_linear_names: List[str] = None):
     """
-    Recursively replace Linear layers that match the given target_linear_names
-    with LoRALinear. If target_linear_names is None, it will replace all nn.Linear.
-    Return the modified module.
+    Replaces specified nn.Linear layers with LoRALinear layers within a model, ensuring device consistency.
     """
-    for name, child in list(module.named_children()):
-        # Recursively apply to children
-        replaced_child = replace_linear_with_lora(
-            child, r=r, alpha=alpha, dropout=dropout, target_linear_names=target_linear_names
-        )
-        setattr(module, name, replaced_child)
+    if target_linear_names is None:
+        logger.warning("No target layer names specified for LoRA replacement. No layers will be replaced.")
+        return model
 
-    # If this is a top-level Linear, check if we should replace it
-    if isinstance(module, nn.Linear):
-        # If no target names provided, replace every linear
-        # Otherwise, replace only if the name is in target_linear_names
-        if (target_linear_names is None) or any(
-            t in module._get_name().lower() for t in target_linear_names
-        ):
-            # Gather info
-            in_features = module.in_features
-            out_features = module.out_features
-            bias = module.bias is not None
+    for name, module in list(model.named_modules()):
+        if isinstance(module, nn.Linear) and any(target_name in name for target_name in target_linear_names):
+            parent_name, child_name = name.rsplit('.', 1)
+            
+            parent_module = model
+            for part in parent_name.split('.'):
+                parent_module = getattr(parent_module, part)
 
-            # Create LoRALinear
+            original_device = module.weight.device
+            original_dtype = module.weight.dtype
+
+            # Create the new LoRA layer
             lora_linear = LoRALinear(
-                in_features=in_features,
-                out_features=out_features,
+                in_features=module.in_features,
+                out_features=module.out_features,
                 r=r,
                 alpha=alpha,
                 dropout=dropout,
-                bias=False,
+                bias=(module.bias is not None)
             )
-
-            # Copy the original weights
+            # Copy the original weights and bias
             with torch.no_grad():
                 lora_linear.weight.copy_(module.weight.data)
-                if bias:
+                if module.bias is not None:
                     lora_linear.bias.copy_(module.bias.data)
-
-            return lora_linear
-    return module
+            
+            lora_linear.to(device=original_device, dtype=original_dtype)
+            
+            setattr(parent_module, child_name, lora_linear)
+            logger.info(f"Replaced layer: {name} with LoRALinear on device {original_device}")
+            
+    return model
 
 def load_llama3_tokenizer():
     tokenizer_name = "unsloth/Llama-3.2-1B"
@@ -619,7 +612,8 @@ def prepare_csm_model_for_training():
         model.config.__class__.get = get_method
     if not hasattr(model.config, 'tie_word_embeddings'):
         model.config.tie_word_embeddings = False
-    target_layers = ['q_proj', 'k_proj', 'v_proj', 'o_proj']
+    target_layers = ["q_proj", "k_proj", "v_proj", "o_proj",
+                      "gate_proj", "up_proj", "down_proj",]
     logger.info("Applying LoRA to model...")
     model = replace_linear_with_lora(
         model,
