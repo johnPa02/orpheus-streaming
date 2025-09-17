@@ -602,7 +602,7 @@ def add_segment(text, speaker_id, audio_tensor):
                 total_tokens += len(tokens)
                 if segment.audio is not None:
                     # Approximate frame count to token conversion
-                    audio_frames = segment.audio.size(0) // 285
+                    audio_frames = segment.audio.size(0) // 6094
                     total_tokens += audio_frames
 
             # If we are within limits, the trimming is done.
@@ -622,14 +622,14 @@ def add_segment(text, speaker_id, audio_tensor):
             text_tokens = len(words) + punctuation
             audio_tokens = 0
             if segment.audio is not None:
-                audio_frames = segment.audio.size(0) // 300
+                audio_frames = segment.audio.size(0) // 6094
                 audio_tokens = audio_frames
             return text_tokens + audio_tokens
 
         while dynamic_segments:
             total_estimated_tokens = sum(estimate_tokens(s) for s in protected_segments) + \
                                      sum(estimate_tokens(s) for s in dynamic_segments)
-            if total_estimated_tokens <= 4096:
+            if total_estimated_tokens <= 2048:
                 break
             dynamic_segments.pop(0)
 
