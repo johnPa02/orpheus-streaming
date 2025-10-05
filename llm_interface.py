@@ -1,12 +1,29 @@
+import logging
+import os
 import re
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, List, Optional
+
 import torch
 from vllm import LLM, SamplingParams
+
+logger = logging.getLogger(__name__)
+DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+
+
+def _trim_to_last_sentence(text: str) -> str:
+    """Return *text* truncated at the final full sentence boundary."""
+    match = re.match(r"^(.*?[.!?][\"')\]]?)\s*$", text, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    for idx in range(len(text) - 1, -1, -1):
+        if text[idx] in ".!?":
+            return text[: idx + 1].strip()
+    return text.strip()
 
 class LLMInterface:
     def __init__(self, model_path: str, max_tokens: int = 8192, n_threads: int = 8, gpu_layers: int = -1):
         """Initialize the LLM interface using VLLM with a given model.
-        
+
         Args:
             model_path (str): Path to the model or HuggingFace model name
             max_tokens (int, optional): Maximum context length. Defaults to 8192.
@@ -30,26 +47,6 @@ class LLMInterface:
             "max_tokens": max_tokens,
         }
         
-    def trim_to_last_sentence(self, text: str) -> str:        
-        """
-        Return *text* truncated at the final full sentence boundary.
-        A boundary is considered to be any '.', '!' or '?' followed by
-        optional quotes/brackets, optional whitespace, and then end-of-string.
-
-        If no sentence terminator exists, the original text is returned.
-        """
-        # Regex explanation:
-        #   (.*?[.!?]["')\]]?)   any text lazily until a terminator
-        #   \s*$                 followed only by whitespace till end-of-string
-        m = re.match(r"^(.*?[.!?][\"')\]]?)\s*$", text, re.DOTALL)
-        if m:
-            return m.group(1).strip()
-        # Fall back to manual search (handles cases with additional text)
-        for i in range(len(text) - 1, -1, -1):
-            if text[i] in ".!?":
-                return text[: i + 1].strip()
-        return text.strip()
-    
     def generate_response(self, system_prompt: str, user_message: str, conversation_history: str = "") -> str:
         """Generate a response from the LLM using chat-style prompt formatting.
         
@@ -85,7 +82,7 @@ class LLMInterface:
         # Extract and return the generated text
         if outputs and len(outputs) > 0:
             text = outputs[0].outputs[0].text
-            return self.trim_to_last_sentence(text)
+            return _trim_to_last_sentence(text)
         return ""
     
     def tokenize(self, text: str) -> List[int]:
@@ -163,5 +160,97 @@ class LLMInterface:
                 results.append(output.outputs[0].text.strip())
             else:
                 results.append("")
-                
+
         return results
+
+
+class OpenAIChatInterface:
+    """Thin wrapper around the OpenAI Chat Completions API."""
+
+    def __init__(
+        self,
+        model: Optional[str] = None,
+        max_tokens: int = 8192,
+        temperature: float = 0.7,
+        top_p: float = 0.95,
+    ) -> None:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "OPENAI_API_KEY environment variable is required when using the OpenAI LLM backend."
+            )
+
+        model_name = model or os.getenv("OPENAI_MODEL") or DEFAULT_OPENAI_MODEL
+        self.model = model_name.strip()
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+        self.top_p = top_p
+
+        try:
+            from openai import OpenAI  # type: ignore
+
+            # Explicitly pass api_key to support environments without config files.
+            self._client = OpenAI(api_key=api_key)
+            self._client_type = "client"
+        except ImportError:
+            try:
+                import openai  # type: ignore
+            except ImportError as exc:  # pragma: no cover - depends on runtime env
+                raise RuntimeError(
+                    "The 'openai' package is required to use the OpenAI LLM backend."
+                ) from exc
+
+            openai.api_key = api_key
+            self._client = openai
+            self._client_type = "legacy"
+
+        logger.info("Configured OpenAI backend with model '%s'", self.model)
+
+    def generate_response(
+        self,
+        system_prompt: str,
+        user_message: str,
+        conversation_history: str = "",
+    ) -> str:
+        messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
+
+        history = conversation_history.strip()
+        if history:
+            messages.append({
+                "role": "system",
+                "content": f"Prior conversation context:\n{history}",
+            })
+
+        messages.append({"role": "user", "content": user_message})
+
+        response_max_tokens = min(self.max_tokens, 512)
+
+        try:
+            if self._client_type == "client":
+                completion = self._client.chat.completions.create(  # type: ignore[attr-defined]
+                    model=self.model,
+                    messages=messages,
+                    max_tokens=response_max_tokens,
+                    temperature=self.temperature,
+                    top_p=self.top_p,
+                )
+                choice = completion.choices[0].message.content if completion.choices else ""
+            else:
+                completion = self._client.ChatCompletion.create(  # type: ignore[attr-defined]
+                    model=self.model,
+                    messages=messages,
+                    max_tokens=response_max_tokens,
+                    temperature=self.temperature,
+                    top_p=self.top_p,
+                )
+                if completion["choices"]:
+                    choice = completion["choices"][0]["message"].get("content", "")
+                else:
+                    choice = ""
+        except Exception as exc:  # pragma: no cover - depends on remote service
+            raise RuntimeError("OpenAI chat completion failed") from exc
+
+        if not choice:
+            return ""
+
+        return _trim_to_last_sentence(choice)

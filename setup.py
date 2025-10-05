@@ -20,7 +20,7 @@ def check_requirements():
     requirements = [
         "torch", "torchaudio", "fastapi", "uvicorn", "websockets", "numpy",
         "scikit-learn", "sqlalchemy", "pydantic", "jinja2", "whisper",
-        "sounddevice", "soundfile", "sentence_transformers", "ctransformers"
+        "sentence_transformers", "ctransformers"
     ]
     
     missing = []

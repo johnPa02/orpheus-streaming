@@ -13,7 +13,6 @@ import queue
 from fastapi.websockets import WebSocketState
 import torch
 import torchaudio
-import sounddevice as sd
 import numpy as np
 import whisper
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
@@ -25,7 +24,7 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from typing import Optional
 from generator import Segment, load_csm_1b_local
-from llm_interface import LLMInterface
+from llm_interface import LLMInterface, OpenAIChatInterface
 from rag_system import RAGSystem 
 from vad import AudioStreamProcessor
 from pydantic import BaseModel
@@ -198,13 +197,43 @@ def transcribe_audio(audio_data, sample_rate):
     except:
         return "[Transcription error]"
 
+
+def resolve_llm_backend(llm_path: str):
+    """Return a tuple of (backend, model_name) based on the llm_path configuration."""
+    spec = (llm_path or "").strip()
+    if not spec:
+        return "openai", None
+
+    lowered = spec.lower()
+    if lowered == "openai":
+        return "openai", None
+
+    if lowered.startswith("openai:"):
+        _, _, model_name = spec.partition(":")
+        return "openai", model_name.strip() or None
+
+    return "local", spec
+
 def initialize_models(config_data: CompanionConfig):
     global generator, llm, rag, vad_processor, config
     config = config_data                         
 
-    logger.info("Loading LLM …")
-    llm = LLMInterface(config_data.llm_path,
-                       config_data.max_tokens)
+    backend, backend_model = resolve_llm_backend(config_data.llm_path)
+
+    if backend == "openai":
+        logger.info("Using OpenAI API for LLM responses; skipping local model load")
+        llm_instance = OpenAIChatInterface(
+            model=backend_model,
+            max_tokens=config_data.max_tokens,
+        )
+    else:
+        logger.info("Loading local LLM …")
+        llm_instance = LLMInterface(
+            config_data.llm_path,
+            config_data.max_tokens,
+        )
+
+    llm = llm_instance
 
     logger.info("Loading RAG …")
     rag = RAGSystem("companion.db",

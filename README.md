@@ -13,6 +13,7 @@ Our fork adds **streaming audio generation**, **real-time playback**, and **perf
 * Similarly, Python 3.10 is recommended, but newer versions may be fine
 * For some audio operations, `ffmpeg` may be required
 * For real-time audio playback: `pip install sounddevice`
+  * Skip this on headless GPU pods (e.g., RunPod) to avoid PortAudio build errors—the app falls back to streaming-only mode.
 * Access to the following Hugging Face models:
   * [Llama-3.2-1B](https://huggingface.co/meta-llama/Llama-3.2-1B)
   * [CSM-1B](https://huggingface.co/sesame/csm-1b)
