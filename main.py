@@ -23,7 +23,8 @@ from sqlalchemy import create_engine, Column, Integer, String, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from typing import Optional
-from generator import Segment, load_csm_1b_local
+from generator import Segment
+from orpheus_adapter import load_orpheus_generator
 from llm_interface import LLMInterface, OpenAIChatInterface
 from rag_system import RAGSystem 
 from vad import AudioStreamProcessor
@@ -79,10 +80,11 @@ class CompanionConfig(BaseModel):
     reference_text2: Optional[str] = None  # optional field
     reference_audio_path3: Optional[str] = None  # optional field
     reference_text3: Optional[str] = None  # optional field
-    model_path: str
+    model_path: str = "canopylabs/orpheus-tts-0.1-finetune-prod"
     llm_path: str
     max_tokens: int = 8192
     voice_speaker_id: int = 0
+    voice_name: str = "tara"
     vad_enabled: bool = True
     vad_threshold: float = 0.5
     embedding_model: str = "all-MiniLM-L6-v2"
@@ -217,6 +219,9 @@ def resolve_llm_backend(llm_path: str):
 def initialize_models(config_data: CompanionConfig):
     global generator, llm, rag, vad_processor, config
     config = config_data                         
+
+    if generator and hasattr(generator, "set_voice"):
+        generator.set_voice(config_data.voice_name)
 
     backend, backend_model = resolve_llm_backend(config_data.llm_path)
 
@@ -470,11 +475,12 @@ def model_worker(cfg: CompanionConfig):
     logger.info("Model worker thread started")
 
     if generator is None:
-        torch._inductor.config.triton.cudagraphs = False  # Disable cudagraphs
-        torch._inductor.config.fx_graph_cache = False  # Disable graph caching
-        logger.info("Loading voice model inside worker thread …")
-        generator = load_csm_1b_local(cfg.model_path, "cuda")
-        logger.info("Voice model ready (compiled with cudagraphs)")
+        logger.info("Loading Orpheus-TTS voice engine …")
+        generator = load_orpheus_generator(cfg.model_path, cfg.voice_name)
+        logger.info("Voice model ready")
+    else:
+        if hasattr(generator, "set_voice"):
+            generator.set_voice(cfg.voice_name)
 
     while model_thread_running.is_set():
         try:
@@ -619,7 +625,8 @@ def add_segment(text, speaker_id, audio_tensor):
 
     # Then, check and trim by token count if necessary.
     # This loop will trim the oldest dynamic segments until the token count is acceptable.
-    if hasattr(generator, '_text_tokenizer'):
+    tokenizer = getattr(generator, '_text_tokenizer', None)
+    if tokenizer:
         while dynamic_segments:
             # Tentatively combine for token calculation
             temp_full_list = protected_segments + dynamic_segments
@@ -627,7 +634,7 @@ def add_segment(text, speaker_id, audio_tensor):
 
             # Calculate total tokens for the current combination
             for segment in temp_full_list:
-                tokens = generator._text_tokenizer.encode(f"[{segment.speaker}]{segment.text}")
+                tokens = tokenizer.encode(f"[{segment.speaker}]{segment.text}")
                 total_tokens += len(tokens)
                 if segment.audio is not None:
                     # Approximate frame count to token conversion
@@ -643,7 +650,9 @@ def add_segment(text, speaker_id, audio_tensor):
 
     else:
         # Fallback if tokenizer is not available
-        logger.warning("Unable to access tokenizer - falling back to word-based estimation for context trimming")
+        if not getattr(add_segment, "_context_warning_logged", False):
+            logger.warning("Unable to access tokenizer - falling back to word-based estimation for context trimming")
+            add_segment._context_warning_logged = True
 
         def estimate_tokens(segment):
             words = segment.text.split()
@@ -761,7 +770,10 @@ def audio_generation_thread(text, output_file):
         words_per_second = avg_wpm / 60
         estimated_seconds = len(words) / words_per_second
         max_audio_length_ms = int(estimated_seconds * 1000)
-        
+
+        if generator and hasattr(generator, "set_voice"):
+            generator.set_voice(config.voice_name)
+
         # Send request to model thread
         logger.info(f"Audio generation {this_id} - sending request to model thread")
         model_queue.put((

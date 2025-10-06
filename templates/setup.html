@@ -53,8 +53,11 @@ display: none;
 <label>System Prompt:
 <textarea id="systemPrompt" class="w-full p-2 bg-gray-700 rounded mt-1">You are a friendly AI.</textarea>
 </label>
-<label>Model Path:
-<input type="text" id="modelPath" class="w-full p-2 bg-gray-700 rounded mt-1" value="./finetuned_model">
+<label>Model Name:
+<input type="text" id="modelPath" class="w-full p-2 bg-gray-700 rounded mt-1" value="canopylabs/orpheus-tts-0.1-finetune-prod">
+</label>
+<label>Voice Name:
+<input type="text" id="voiceName" class="w-full p-2 bg-gray-700 rounded mt-1" value="tara">
 </label>
 <label>LLM Path / Provider (e.g., <code>./models/llama3-8b-instruct.gguf</code> or <code>openai:gpt-4o-mini</code>):
 <input type="text" id="llmPath" class="w-full p-2 bg-gray-700 rounded mt-1" value="./models/llama3-8b-instruct.gguf">

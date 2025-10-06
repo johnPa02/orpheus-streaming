@@ -20,6 +20,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (data.type === "saved_config" && data.config) {
       document.getElementById('systemPrompt').value = data.config.system_prompt || "";
       document.getElementById('modelPath').value = data.config.model_path || "";
+      document.getElementById('voiceName').value = data.config.voice_name || "tara";
       document.getElementById('llmPath').value = data.config.llm_path || "";
       document.getElementById('referenceAudio').value = data.config.reference_audio_path || "";
       document.getElementById('referenceText').value = data.config.reference_text || "";
@@ -107,6 +108,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     lastConfig = {
       system_prompt: document.getElementById('systemPrompt').value,
       model_path: document.getElementById('modelPath').value,
+      voice_name: document.getElementById('voiceName').value,
       llm_path: document.getElementById('llmPath').value,
       reference_audio_path: document.getElementById('referenceAudio').value,
       reference_text: document.getElementById('referenceText').value,
