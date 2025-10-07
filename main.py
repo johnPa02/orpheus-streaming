@@ -269,8 +269,8 @@ def initialize_models(config_data: CompanionConfig):
         config_data.voice_speaker_id,        # speaker
         [],                                  # no context
         500,                                 # max_ms
-        0.7,                                 # temperature
-        40,                                  # top‑k
+        0.4,                                 # temperature tuned for streaming
+        0.9,                                 # top_p to match runtime path
     ))
 
     # block until worker signals EOS (None marker)
@@ -488,7 +488,7 @@ def model_worker(cfg: CompanionConfig):
             if request is None:
                 break
 
-            text, speaker_id, context, max_ms, temperature, topk = request
+            text, speaker_id, context, max_ms, temperature, top_p = request
 
             for chunk in generator.generate_stream(
                     text=text,
@@ -496,7 +496,7 @@ def model_worker(cfg: CompanionConfig):
                     context=context,
                     max_audio_length_ms=max_ms,
                     temperature=temperature,
-                    topk=topk):
+                    top_p=top_p):
                 model_result_queue.put(chunk)
 
                 if not model_thread_running.is_set():
@@ -736,8 +736,7 @@ def audio_generation_thread(text, output_file):
         all_audio_chunks = []
         
         # Prepare text
-        text_lower = text.lower()
-        text_lower = preprocess_text_for_tts(text_lower)
+        clean_text = preprocess_text_for_tts(text)
         
         asyncio.run_coroutine_threadsafe(
             message_queue.put({
@@ -777,12 +776,12 @@ def audio_generation_thread(text, output_file):
         # Send request to model thread
         logger.info(f"Audio generation {this_id} - sending request to model thread")
         model_queue.put((
-            text_lower,
+            clean_text,
             config.voice_speaker_id,
             reference_segments,
             max_audio_length_ms,
-            0.8,  # temperature
-            50    # topk
+            0.4,  # temperature tuned for Orpheus streaming
+            0.9   # top_p
         ))
         
         # Start timing
@@ -882,7 +881,7 @@ def audio_generation_thread(text, output_file):
             try:
                 complete_audio = torch.cat(all_audio_chunks)
                 save_audio_and_trim(output_file, "default", config.voice_speaker_id, complete_audio, generator.sample_rate)
-                add_segment(text.lower(), config.voice_speaker_id, complete_audio)
+                add_segment(clean_text, config.voice_speaker_id, complete_audio)
                 
                 # Log statistics
                 total_time = time.time() - generation_start
@@ -1049,11 +1048,12 @@ async def websocket_endpoint(websocket: WebSocket):
                             logger.warning(f"Config missing {key}")
                     
                     conf = CompanionConfig(**config_data)
-                    
+
                     saved = config_manager.save_config(config_data)
-                    
+
                     if saved:
-                        initialize_models(conf)
+                        loop_runner = asyncio.get_running_loop()
+                        await loop_runner.run_in_executor(None, initialize_models, conf)
                         await websocket.send_json({"type": "status", "message": "Models initialized and configuration saved"})
                     else:
                         await websocket.send_json({"type": "error", "message": "Failed to save configuration"})

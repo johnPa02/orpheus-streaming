@@ -18,9 +18,6 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL_NAME = "canopylabs/orpheus-tts-0.1-finetune-prod"
 DEFAULT_SAMPLE_RATE = 24_000
-CHUNK_SECONDS = 0.32
-MIN_START_BUFFER_SECONDS = 0.64
-FADE_DURATION_MS = 12
 
 
 class CustomOrpheusModel(OrpheusModel):
@@ -129,83 +126,6 @@ def _bytes_to_tensor(chunk: bytes) -> torch.Tensor:
     return torch.from_numpy(float_samples)
 
 
-def _apply_start_crossfade(chunk: torch.Tensor, previous_tail: Optional[torch.Tensor], fade_samples: int) -> torch.Tensor:
-    if previous_tail is None or chunk.numel() == 0 or fade_samples <= 0:
-        return chunk
-
-    fade_len = min(fade_samples, previous_tail.numel(), chunk.numel())
-    if fade_len == 0:
-        return chunk
-
-    ramp = torch.linspace(0.0, 1.0, fade_len, device=chunk.device)
-    chunk[:fade_len] = previous_tail[-fade_len:] * (1.0 - ramp) + chunk[:fade_len] * ramp
-    return chunk
-
-
-def _apply_end_fade(chunk: torch.Tensor, fade_samples: int) -> torch.Tensor:
-    if chunk.numel() == 0 or fade_samples <= 0:
-        return chunk
-
-    fade_len = min(fade_samples, chunk.numel())
-    if fade_len == 0:
-        return chunk
-
-    ramp = torch.linspace(1.0, 0.0, fade_len, device=chunk.device)
-    chunk[-fade_len:] = chunk[-fade_len:] * ramp
-    return chunk
-
-
-class _PCMChunker:
-    """Collect PCM bytes and emit evenly sized torch tensors with simple crossfades."""
-
-    def __init__(self, sample_rate: int) -> None:
-        self.sample_rate = sample_rate
-        self.chunk_samples = max(1, int(sample_rate * CHUNK_SECONDS))
-        start_min_samples = int(sample_rate * MIN_START_BUFFER_SECONDS)
-        self.start_threshold = max(self.chunk_samples * 2, start_min_samples)
-        self.fade_samples = max(1, int(sample_rate * (FADE_DURATION_MS / 1000.0)))
-
-        self._buffer = torch.empty(0, dtype=torch.float32)
-        self._prev_tail: Optional[torch.Tensor] = None
-        self._started = False
-
-    def add(self, pcm_chunk: torch.Tensor) -> Iterable[torch.Tensor]:
-        if pcm_chunk.numel() == 0:
-            return []
-
-        if self._buffer.numel() == 0:
-            self._buffer = pcm_chunk
-        else:
-            self._buffer = torch.cat((self._buffer, pcm_chunk))
-
-        return list(self._drain())
-
-    def flush(self) -> Iterable[torch.Tensor]:
-        if self._buffer.numel() == 0:
-            return []
-
-        final = self._buffer.clone()
-        final = _apply_start_crossfade(final, self._prev_tail, self.fade_samples)
-        final = _apply_end_fade(final, self.fade_samples)
-        self._buffer = torch.empty(0, dtype=torch.float32)
-        return [final]
-
-    def _drain(self) -> Iterable[torch.Tensor]:
-        while True:
-            required = self.start_threshold if not self._started else self.chunk_samples
-            if self._buffer.numel() < required:
-                break
-
-            chunk = self._buffer[:self.chunk_samples].clone()
-            self._buffer = self._buffer[self.chunk_samples:]
-
-            chunk = _apply_start_crossfade(chunk, self._prev_tail, self.fade_samples)
-            self._prev_tail = chunk[-self.fade_samples:].clone() if chunk.numel() >= self.fade_samples else chunk.clone()
-
-            self._started = True
-            yield chunk
-
-
 class OrpheusGenerator:
     def __init__(
             self,
@@ -255,7 +175,7 @@ class OrpheusGenerator:
             context: List["Segment"],
             max_audio_length_ms: float,
             temperature: float,
-            topk: int,
+            top_p: float,
     ) -> Iterable[torch.Tensor]:
         max_tokens = self._estimate_max_tokens(max_audio_length_ms)
         try:
@@ -263,27 +183,21 @@ class OrpheusGenerator:
                 prompt=text,
                 voice=self.voice,
                 temperature=max(0.1, temperature),
-                top_p=0.9,
+                top_p=top_p if top_p and top_p > 0 else 0.9,
                 repetition_penalty=1.1,
                 stop_token_ids=[128258],
                 max_tokens=max_tokens,
             )
         except Exception as exc:
             logger.error("Failed to start Orpheus stream: %s", exc)
-            return
-
-        chunker = _PCMChunker(self.sample_rate)
+            return []
 
         for chunk in stream:
             tensor = _bytes_to_tensor(chunk)
             if tensor.numel() == 0:
                 continue
 
-            for emit in chunker.add(tensor):
-                yield emit
-
-        for emit in chunker.flush():
-            yield emit
+            yield tensor
 
     def _estimate_max_tokens(self, max_audio_length_ms: float) -> int:
         if not max_audio_length_ms or max_audio_length_ms <= 0:
