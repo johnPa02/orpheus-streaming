@@ -18,15 +18,15 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL_NAME = "canopylabs/orpheus-tts-0.1-finetune-prod"
 DEFAULT_SAMPLE_RATE = 24_000
-TARGET_CHUNK_SECONDS = 0.28
-MAX_CHUNK_SECONDS = 0.55
+CHUNK_SECONDS = 0.32
+MIN_START_BUFFER_SECONDS = 0.64
 FADE_DURATION_MS = 12
 
 
 class CustomOrpheusModel(OrpheusModel):
     """Custom OrpheusModel that supports memory constraints to fix KV cache issues."""
 
-    def __init__(self, model_name, dtype=torch.bfloat16, max_model_len=2048, gpu_memory_utilization=0.85):
+    def __init__(self, model_name, dtype=torch.float16, max_model_len=2048, gpu_memory_utilization=0.85):
         self.max_model_len = max_model_len
         self.gpu_memory_utilization = gpu_memory_utilization
         self._active_requests = set()  # Track active request IDs
@@ -155,6 +155,57 @@ def _apply_end_fade(chunk: torch.Tensor, fade_samples: int) -> torch.Tensor:
     return chunk
 
 
+class _PCMChunker:
+    """Collect PCM bytes and emit evenly sized torch tensors with simple crossfades."""
+
+    def __init__(self, sample_rate: int) -> None:
+        self.sample_rate = sample_rate
+        self.chunk_samples = max(1, int(sample_rate * CHUNK_SECONDS))
+        start_min_samples = int(sample_rate * MIN_START_BUFFER_SECONDS)
+        self.start_threshold = max(self.chunk_samples * 2, start_min_samples)
+        self.fade_samples = max(1, int(sample_rate * (FADE_DURATION_MS / 1000.0)))
+
+        self._buffer = torch.empty(0, dtype=torch.float32)
+        self._prev_tail: Optional[torch.Tensor] = None
+        self._started = False
+
+    def add(self, pcm_chunk: torch.Tensor) -> Iterable[torch.Tensor]:
+        if pcm_chunk.numel() == 0:
+            return []
+
+        if self._buffer.numel() == 0:
+            self._buffer = pcm_chunk
+        else:
+            self._buffer = torch.cat((self._buffer, pcm_chunk))
+
+        return list(self._drain())
+
+    def flush(self) -> Iterable[torch.Tensor]:
+        if self._buffer.numel() == 0:
+            return []
+
+        final = self._buffer.clone()
+        final = _apply_start_crossfade(final, self._prev_tail, self.fade_samples)
+        final = _apply_end_fade(final, self.fade_samples)
+        self._buffer = torch.empty(0, dtype=torch.float32)
+        return [final]
+
+    def _drain(self) -> Iterable[torch.Tensor]:
+        while True:
+            required = self.start_threshold if not self._started else self.chunk_samples
+            if self._buffer.numel() < required:
+                break
+
+            chunk = self._buffer[:self.chunk_samples].clone()
+            self._buffer = self._buffer[self.chunk_samples:]
+
+            chunk = _apply_start_crossfade(chunk, self._prev_tail, self.fade_samples)
+            self._prev_tail = chunk[-self.fade_samples:].clone() if chunk.numel() >= self.fade_samples else chunk.clone()
+
+            self._started = True
+            yield chunk
+
+
 class OrpheusGenerator:
     def __init__(
             self,
@@ -221,38 +272,18 @@ class OrpheusGenerator:
             logger.error("Failed to start Orpheus stream: %s", exc)
             return
 
-        target_samples = max(1, int(self.sample_rate * TARGET_CHUNK_SECONDS))
-        max_samples = max(target_samples, int(self.sample_rate * MAX_CHUNK_SECONDS))
-        fade_samples = max(1, int(self.sample_rate * (FADE_DURATION_MS / 1000.0)))
-
-        buffer = torch.empty(0, dtype=torch.float32)
-        prev_tail: Optional[torch.Tensor] = None
+        chunker = _PCMChunker(self.sample_rate)
 
         for chunk in stream:
             tensor = _bytes_to_tensor(chunk)
             if tensor.numel() == 0:
                 continue
 
-            if buffer.numel() == 0:
-                buffer = tensor
-            else:
-                buffer = torch.cat((buffer, tensor))
+            for emit in chunker.add(tensor):
+                yield emit
 
-            while buffer.numel() >= target_samples:
-                emit_len = min(buffer.numel(), max_samples)
-                emit_chunk = buffer[:emit_len].clone()
-                buffer = buffer[emit_len:]
-
-                emit_chunk = _apply_start_crossfade(emit_chunk, prev_tail, fade_samples)
-                prev_tail = emit_chunk[-fade_samples:].clone() if emit_chunk.numel() >= fade_samples else emit_chunk.clone()
-
-                yield emit_chunk
-
-        if buffer.numel() > 0:
-            final_chunk = buffer.clone()
-            final_chunk = _apply_start_crossfade(final_chunk, prev_tail, fade_samples)
-            final_chunk = _apply_end_fade(final_chunk, fade_samples)
-            yield final_chunk
+        for emit in chunker.flush():
+            yield emit
 
     def _estimate_max_tokens(self, max_audio_length_ms: float) -> int:
         if not max_audio_length_ms or max_audio_length_ms <= 0:
